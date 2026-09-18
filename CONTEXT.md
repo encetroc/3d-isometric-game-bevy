@@ -26,9 +26,35 @@ _Avoid_: Checker Tile, terrain tile
 A simple object that exists in the World and can be picked up, previewed, and dropped onto the Placement Grid.
 _Avoid_: Item, prop
 
+**Crafted Object**:
+A Placeable Object assembled from Voxel Cubes in Creation Mode.
+_Avoid_: Build, creation
+
+**Voxel Cube**:
+The smallest cubic unit from which a Crafted Object is assembled. Voxel Cubes occupy Builder Cells and may be attached to any face of another Voxel Cube.
+_Avoid_: Block, brick
+
+**Builder Cell**:
+The cubic location used to assemble Voxel Cubes in Creation Mode. Each Builder Cell is 0.25 world units wide; the Workbench surface contains four Builder Cells across each axis, with height limited to fifty cells.
+_Avoid_: Placement Cell, voxel
+
+**Builder Volume**:
+The bounded one-world-tile Workbench surface in which a Crafted Object is assembled. It is organized as a four-by-four grid of 0.25-unit Builder Cells.
+_Avoid_: Build area, canvas
+
 **Object Preview**:
 The temporary visual representation of a Placeable Object at the mouse’s snapped Placement Cell. It is green when the drop is valid and red when it is invalid.
 _Avoid_: ghost object
+
+## Creation
+
+**Workbench**:
+A fixed object in the World that opens Creation Mode when activated.
+_Avoid_: Crafting table, builder
+
+**Creation Mode**:
+The focused interaction state in which Voxel Cubes are assembled into a Crafted Object at the Workbench.
+_Avoid_: Build mode, editor
 
 ## Actors and View
 

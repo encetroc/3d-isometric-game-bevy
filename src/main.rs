@@ -2,9 +2,11 @@ use bevy::{
     camera::ScalingMode,
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     math::Ray3d,
+    pbr::wireframe::{Wireframe, WireframePlugin, WireframeTopology},
     prelude::*,
     window::{PrimaryWindow, WindowResolution},
 };
+use std::collections::{HashSet, VecDeque};
 
 const GRID_SIZE: i32 = 20;
 const TILE_SIZE: f32 = 1.0;
@@ -15,10 +17,25 @@ const WORLD_SIZE: f32 = GRID_SIZE as f32 * TILE_SIZE;
 const WORLD_MIN: f32 = -WORLD_SIZE / 2.0;
 const OBJECT_HEIGHT: f32 = 0.62;
 const OBJECT_FOOTPRINT: IVec2 = IVec2::new(2, 2);
+const WORKBENCH_FOOTPRINT: IVec2 = IVec2::new(4, 4);
+const WORKBENCH_HEIGHT: f32 = 0.72;
+const BUILDER_WORLD_SIZE: f32 = TILE_SIZE;
+// The Workbench is a four-by-four builder grid. Each Voxel Cube is a quarter
+// of a world tile, so the visible divisions are 0.25 world units wide.
+const WORKBENCH_PLACEMENT_CELLS_PER_AXIS: i32 = 4;
+const BUILDER_CELL_SIZE: f32 = 0.25;
+const BUILDER_CELLS_PER_AXIS: i32 = (BUILDER_WORLD_SIZE / BUILDER_CELL_SIZE) as i32;
+const BUILDER_CELLS_PER_PLACEMENT_CELL: i32 =
+    BUILDER_CELLS_PER_AXIS / WORKBENCH_PLACEMENT_CELLS_PER_AXIS;
+const BUILDER_MAX_HEIGHT_CELLS: i32 = 50;
 const PLAYER_SPEED: f32 = 5.0;
 const CAMERA_OFFSET: Vec3 = Vec3::new(9.0, 11.0, 9.0);
 const CAMERA_ROTATION_DECAY_RATE: f32 = 12.0;
+const CAMERA_FOCUS_DECAY_RATE: f32 = 10.0;
 const CAMERA_ROTATION_SNAP_THRESHOLD: f32 = 0.0001;
+const WORLD_CAMERA_VIEWPORT: f32 = 14.0;
+const BUILDER_CAMERA_VIEWPORT: f32 = 2.0;
+const BUILDER_CAMERA_DISTANCE_SCALE: f32 = 0.24;
 
 #[derive(Component)]
 struct Player;
@@ -27,12 +44,34 @@ struct Player;
 struct TopDownCamera;
 
 #[derive(Component)]
+struct Workbench {
+    cell: IVec2,
+    footprint: IVec2,
+}
+
+#[derive(Component)]
 struct PerformanceOverlay;
+
+#[derive(Component)]
+struct CreationUi;
+
+#[derive(Component)]
+struct BuilderGridVisual;
+
+#[derive(Component)]
+struct BuilderVoxelVisual;
+
+#[derive(Component)]
+struct BuilderHoverVisual;
+
+#[derive(Component)]
+struct ObjectBoundsVisual;
 
 #[derive(Component)]
 struct PlaceableObject {
     cell: IVec2,
     footprint: IVec2,
+    height: f32,
 }
 
 #[derive(Component)]
@@ -45,6 +84,37 @@ struct DraggingObject;
 struct PlacementMaterials {
     valid: Handle<StandardMaterial>,
     invalid: Handle<StandardMaterial>,
+}
+
+#[derive(Resource)]
+struct BuilderMaterials {
+    cube: Handle<StandardMaterial>,
+    hover_valid: Handle<StandardMaterial>,
+    hover_invalid: Handle<StandardMaterial>,
+}
+
+#[derive(Resource)]
+struct BuilderMeshes {
+    cube: Handle<Mesh>,
+    unit: Handle<Mesh>,
+}
+
+#[derive(Default)]
+struct BuilderVisualCache {
+    active: bool,
+    workbench: Option<Entity>,
+    revision: u64,
+    initialized: bool,
+}
+
+#[derive(Resource, Default)]
+struct CreationState {
+    active: bool,
+    workbench: Option<Entity>,
+    cubes: HashSet<IVec3>,
+    hovered: Option<IVec3>,
+    hover_valid: bool,
+    revision: u64,
 }
 
 #[derive(Resource, Default)]
@@ -116,18 +186,26 @@ fn main() {
             ..default()
         }))
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
+        .add_plugins(WireframePlugin::default())
         .init_resource::<CameraOrbit>()
+        .init_resource::<CreationState>()
         .init_resource::<DragState>()
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
+                begin_creation_mode,
                 rotate_camera,
                 move_player,
                 follow_player_camera,
+                update_creation_input,
+                finish_creation_mode,
+                update_builder_visuals,
                 begin_object_drag,
                 update_object_drag,
                 finish_object_drag,
+                update_object_bounds,
+                update_creation_ui,
             )
                 .chain(),
         )
@@ -236,31 +314,150 @@ fn setup(
         ..default()
     });
     commands.insert_resource(PlacementMaterials {
-        valid: valid_material,
-        invalid: invalid_material,
+        valid: valid_material.clone(),
+        invalid: invalid_material.clone(),
     });
+
+    let builder_cube_mesh = meshes.add(Cuboid::new(
+        BUILDER_CELL_SIZE,
+        BUILDER_CELL_SIZE,
+        BUILDER_CELL_SIZE,
+    ));
+    let builder_unit_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+    let builder_cube_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.86, 0.68, 0.24),
+        perceptual_roughness: 0.7,
+        ..default()
+    });
+    let builder_grid_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.7, 0.9, 1.0, 0.28),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+    let builder_major_grid_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.7, 0.9, 1.0, 0.82),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+    let builder_hover_valid = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.18, 0.95, 0.35, 0.42),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+    let builder_hover_invalid = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.95, 0.12, 0.12, 0.42),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+    commands.insert_resource(BuilderMaterials {
+        cube: builder_cube_material,
+        hover_valid: builder_hover_valid,
+        hover_invalid: builder_hover_invalid,
+    });
+    commands.insert_resource(BuilderMeshes {
+        cube: builder_cube_mesh,
+        unit: builder_unit_mesh.clone(),
+    });
+
+    let workbench_cell = IVec2::new(48, 48);
+    let workbench_mesh = meshes.add(Cuboid::new(TILE_SIZE, WORKBENCH_HEIGHT, TILE_SIZE));
+    let workbench_material = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.42, 0.22, 0.09),
+        perceptual_roughness: 0.82,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(workbench_mesh),
+        MeshMaterial3d(workbench_material),
+        Transform::from_translation(object_center_at(
+            workbench_cell,
+            WORKBENCH_FOOTPRINT,
+            WORKBENCH_HEIGHT,
+        )),
+        Workbench {
+            cell: workbench_cell,
+            footprint: WORKBENCH_FOOTPRINT,
+        },
+    ));
+
+    let builder_grid_mesh_x = meshes.add(Cuboid::new(0.002, 0.012, BUILDER_WORLD_SIZE));
+    let builder_grid_mesh_z = meshes.add(Cuboid::new(BUILDER_WORLD_SIZE, 0.012, 0.002));
+    let workbench_center = object_center_at(workbench_cell, WORKBENCH_FOOTPRINT, WORKBENCH_HEIGHT);
+    let builder_grid_y = workbench_center.y + WORKBENCH_HEIGHT / 2.0 + 0.006;
+    let builder_origin_x = workbench_center.x - BUILDER_WORLD_SIZE / 2.0;
+    let builder_origin_z = workbench_center.z - BUILDER_WORLD_SIZE / 2.0;
+    for index in 0..=BUILDER_CELLS_PER_AXIS {
+        let coordinate = index as f32 * BUILDER_CELL_SIZE;
+        let material = if index % BUILDER_CELLS_PER_PLACEMENT_CELL == 0 {
+            builder_major_grid_material.clone()
+        } else {
+            builder_grid_material.clone()
+        };
+        commands.spawn((
+            Mesh3d(builder_grid_mesh_x.clone()),
+            MeshMaterial3d(material.clone()),
+            Transform::from_xyz(
+                builder_origin_x + coordinate,
+                builder_grid_y,
+                workbench_center.z,
+            ),
+            Visibility::Hidden,
+            BuilderGridVisual,
+        ));
+        commands.spawn((
+            Mesh3d(builder_grid_mesh_z.clone()),
+            MeshMaterial3d(material),
+            Transform::from_xyz(
+                workbench_center.x,
+                builder_grid_y,
+                builder_origin_z + coordinate,
+            ),
+            Visibility::Hidden,
+            BuilderGridVisual,
+        ));
+    }
 
     for (cell, material) in [
         (IVec2::new(37, 37), object_materials[0].clone()),
         (IVec2::new(47, 38), object_materials[1].clone()),
         (IVec2::new(42, 48), object_materials[2].clone()),
     ] {
-        commands.spawn((
-            Mesh3d(object_mesh.clone()),
-            MeshMaterial3d(material),
-            Transform::from_translation(object_center(cell, OBJECT_FOOTPRINT)),
-            PlaceableObject {
-                cell,
-                footprint: OBJECT_FOOTPRINT,
-            },
-        ));
+        commands
+            .spawn((
+                Mesh3d(object_mesh.clone()),
+                MeshMaterial3d(material),
+                Transform::from_translation(object_center(cell, OBJECT_FOOTPRINT)),
+                PlaceableObject {
+                    cell,
+                    footprint: OBJECT_FOOTPRINT,
+                    height: OBJECT_HEIGHT,
+                },
+            ))
+            .with_children(|parent| {
+                parent.spawn((
+                    Mesh3d(builder_unit_mesh.clone()),
+                    Wireframe,
+                    WireframeTopology::Quads,
+                    Transform::from_scale(Vec3::new(
+                        OBJECT_FOOTPRINT.x as f32 * CELL_SIZE,
+                        OBJECT_HEIGHT,
+                        OBJECT_FOOTPRINT.y as f32 * CELL_SIZE,
+                    )),
+                    Visibility::Hidden,
+                    ObjectBoundsVisual,
+                ));
+            });
     }
 
     commands.spawn((
         Camera3d::default(),
         Projection::from(OrthographicProjection {
             scaling_mode: ScalingMode::FixedVertical {
-                viewport_height: 14.0,
+                viewport_height: WORLD_CAMERA_VIEWPORT,
             },
             ..OrthographicProjection::default_3d()
         }),
@@ -270,7 +467,7 @@ fn setup(
 
     commands.spawn((
         Text::new(
-            "WASD / Arrow Keys  •  Move    Q / E  •  Orbit camera 45°\nClick an object to grab, move it, then click again to drop  •  Green = valid  •  Red = blocked",
+            "WASD / Arrow Keys  •  Move    Q / E  •  Orbit camera 45°\nClick an object to grab, move it, then click again to drop  •  Green = valid  •  Red = blocked\nRight-click the Workbench to create a voxel object",
         ),
         Node {
             position_type: PositionType::Absolute,
@@ -278,6 +475,22 @@ fn setup(
             left: px(18),
             ..default()
         },
+    ));
+
+    commands.spawn((
+        Text::new("Creation Mode"),
+        TextFont::from_font_size(18.0),
+        TextColor(Color::srgb(0.9, 0.96, 1.0)),
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: px(18),
+            left: px(18),
+            padding: UiRect::all(px(10)),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.02, 0.04, 0.07, 0.86)),
+        Visibility::Hidden,
+        CreationUi,
     ));
 
     commands
@@ -302,9 +515,13 @@ fn setup(
 }
 
 fn object_center(cell: IVec2, footprint: IVec2) -> Vec3 {
+    object_center_at(cell, footprint, OBJECT_HEIGHT)
+}
+
+fn object_center_at(cell: IVec2, footprint: IVec2, height: f32) -> Vec3 {
     Vec3::new(
         WORLD_MIN + (cell.x as f32 + footprint.x as f32 / 2.0) * CELL_SIZE,
-        TILE_THICKNESS + OBJECT_HEIGHT / 2.0,
+        TILE_THICKNESS + height / 2.0,
         WORLD_MIN + (cell.y as f32 + footprint.y as f32 / 2.0) * CELL_SIZE,
     )
 }
@@ -380,20 +597,504 @@ fn ray_aabb_distance(ray: Ray3d, minimum: Vec3, maximum: Vec3) -> Option<f32> {
     Some(near)
 }
 
+fn point_on_plane(ray: Ray3d, height: f32) -> Option<Vec3> {
+    let direction = *ray.direction;
+    if direction.y.abs() < f32::EPSILON {
+        return None;
+    }
+    let distance = (height - ray.origin.y) / direction.y;
+    (distance >= 0.0).then(|| ray.get_point(distance))
+}
+
+fn builder_origin(workbench: &Transform) -> Vec3 {
+    Vec3::new(
+        workbench.translation.x - BUILDER_WORLD_SIZE / 2.0,
+        workbench.translation.y + WORKBENCH_HEIGHT / 2.0 + 0.01,
+        workbench.translation.z - BUILDER_WORLD_SIZE / 2.0,
+    )
+}
+
+fn builder_cell_center(origin: Vec3, cell: IVec3) -> Vec3 {
+    origin
+        + Vec3::new(
+            (cell.x as f32 + 0.5) * BUILDER_CELL_SIZE,
+            (cell.y as f32 + 0.5) * BUILDER_CELL_SIZE,
+            (cell.z as f32 + 0.5) * BUILDER_CELL_SIZE,
+        )
+}
+
+fn builder_cell_in_bounds(cell: IVec3) -> bool {
+    (0..BUILDER_CELLS_PER_AXIS).contains(&cell.x)
+        && (0..BUILDER_MAX_HEIGHT_CELLS).contains(&cell.y)
+        && (0..BUILDER_CELLS_PER_AXIS).contains(&cell.z)
+}
+
+fn builder_has_neighbor(cubes: &HashSet<IVec3>, cell: IVec3) -> bool {
+    [
+        IVec3::new(1, 0, 0),
+        IVec3::new(-1, 0, 0),
+        IVec3::new(0, 1, 0),
+        IVec3::new(0, -1, 0),
+        IVec3::new(0, 0, 1),
+        IVec3::new(0, 0, -1),
+    ]
+    .into_iter()
+    .any(|direction| cubes.contains(&(cell + direction)))
+}
+
+fn removal_keeps_cubes_connected(cubes: &HashSet<IVec3>, removed: IVec3) -> bool {
+    let remaining = cubes
+        .iter()
+        .copied()
+        .filter(|&cell| cell != removed)
+        .collect::<HashSet<_>>();
+    if remaining.is_empty() {
+        return true;
+    }
+
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    for &cell in &remaining {
+        if cell.y == 0 {
+            visited.insert(cell);
+            queue.push_back(cell);
+        }
+    }
+    while let Some(cell) = queue.pop_front() {
+        for direction in [
+            IVec3::new(1, 0, 0),
+            IVec3::new(-1, 0, 0),
+            IVec3::new(0, 1, 0),
+            IVec3::new(0, -1, 0),
+            IVec3::new(0, 0, 1),
+            IVec3::new(0, 0, -1),
+        ] {
+            let neighbor = cell + direction;
+            if remaining.contains(&neighbor) && visited.insert(neighbor) {
+                queue.push_back(neighbor);
+            }
+        }
+    }
+    visited.len() == remaining.len()
+}
+
+fn builder_face_normal(ray: Ray3d, distance: f32, minimum: Vec3, maximum: Vec3) -> IVec3 {
+    let hit = ray.get_point(distance);
+    let faces = [
+        ((hit.x - minimum.x).abs(), IVec3::new(-1, 0, 0)),
+        ((maximum.x - hit.x).abs(), IVec3::new(1, 0, 0)),
+        ((hit.y - minimum.y).abs(), IVec3::new(0, -1, 0)),
+        ((maximum.y - hit.y).abs(), IVec3::new(0, 1, 0)),
+        ((hit.z - minimum.z).abs(), IVec3::new(0, 0, -1)),
+        ((maximum.z - hit.z).abs(), IVec3::new(0, 0, 1)),
+    ];
+    faces
+        .into_iter()
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map_or(IVec3::Y, |(_, normal)| normal)
+}
+
+fn builder_cube_hit(
+    ray: Ray3d,
+    origin: Vec3,
+    cubes: &HashSet<IVec3>,
+) -> Option<(IVec3, f32, IVec3)> {
+    let mut closest = None;
+    for &cell in cubes {
+        let center = builder_cell_center(origin, cell);
+        let half = Vec3::splat(BUILDER_CELL_SIZE / 2.0);
+        let minimum = center - half;
+        let maximum = center + half;
+        let Some(distance) = ray_aabb_distance(ray, minimum, maximum) else {
+            continue;
+        };
+        if closest
+            .as_ref()
+            .is_none_or(|(_, closest_distance, _)| distance < *closest_distance)
+        {
+            closest = Some((
+                cell,
+                distance,
+                builder_face_normal(ray, distance, minimum, maximum),
+            ));
+        }
+    }
+    closest
+}
+
+struct BuilderTarget {
+    cell: IVec3,
+    existing: bool,
+    valid: bool,
+}
+
+fn builder_target(
+    ray: Ray3d,
+    workbench: &Transform,
+    cubes: &HashSet<IVec3>,
+    remove: bool,
+) -> Option<BuilderTarget> {
+    let origin = builder_origin(workbench);
+    if let Some((cell, _distance, normal)) = builder_cube_hit(ray, origin, cubes) {
+        if remove {
+            return Some(BuilderTarget {
+                cell,
+                existing: true,
+                valid: true,
+            });
+        }
+        let candidate = cell + normal;
+        let valid = builder_cell_in_bounds(candidate)
+            && !cubes.contains(&candidate)
+            && (candidate.y == 0 || builder_has_neighbor(cubes, candidate));
+        return Some(BuilderTarget {
+            cell: candidate,
+            existing: false,
+            valid,
+        });
+    }
+
+    let floor = point_on_plane(ray, origin.y)?;
+    let local = floor - origin;
+    let candidate = IVec3::new(
+        (local.x / BUILDER_CELL_SIZE).floor() as i32,
+        0,
+        (local.z / BUILDER_CELL_SIZE).floor() as i32,
+    );
+    let valid = builder_cell_in_bounds(candidate) && !cubes.contains(&candidate);
+    Some(BuilderTarget {
+        cell: candidate,
+        existing: false,
+        valid,
+    })
+}
+
+fn voxel_bounds(cubes: &HashSet<IVec3>) -> Option<(IVec3, IVec3)> {
+    let mut iterator = cubes.iter();
+    let first = *iterator.next()?;
+    let mut minimum = first;
+    let mut maximum = first;
+    for &cell in iterator {
+        minimum = minimum.min(cell);
+        maximum = maximum.max(cell);
+    }
+    Some((minimum, maximum))
+}
+
+fn rounded_placement_cells(voxel_count: i32) -> i32 {
+    ((voxel_count as f32 * BUILDER_CELL_SIZE) / CELL_SIZE).ceil() as i32
+}
+
+fn crafted_dimensions(cubes: &HashSet<IVec3>) -> Option<(IVec3, IVec3, IVec2, f32)> {
+    let (minimum, maximum) = voxel_bounds(cubes)?;
+    let counts = maximum - minimum + IVec3::ONE;
+    let footprint = IVec2::new(
+        rounded_placement_cells(counts.x),
+        rounded_placement_cells(counts.z),
+    );
+    let height = rounded_placement_cells(counts.y) as f32 * CELL_SIZE;
+    Some((minimum, maximum, footprint, height))
+}
+
+fn begin_creation_mode(
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<TopDownCamera>>,
+    workbenches: Query<(Entity, &Transform, &Workbench)>,
+    drag: Res<DragState>,
+    mut creation: ResMut<CreationState>,
+) {
+    if creation.active || drag.entity.is_some() || !mouse.just_pressed(MouseButton::Right) {
+        return;
+    }
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Ok((camera, camera_transform)) = cameras.single() else {
+        return;
+    };
+    let Some(ray) = cursor_ray(window, camera, camera_transform) else {
+        return;
+    };
+
+    for (entity, transform, workbench) in &workbenches {
+        let half_size = Vec3::new(
+            workbench.footprint.x as f32 * CELL_SIZE / 2.0,
+            WORKBENCH_HEIGHT / 2.0,
+            workbench.footprint.y as f32 * CELL_SIZE / 2.0,
+        );
+        if ray_aabb_distance(
+            ray,
+            transform.translation - half_size,
+            transform.translation + half_size,
+        )
+        .is_some()
+        {
+            creation.active = true;
+            creation.workbench = Some(entity);
+            creation.cubes.clear();
+            creation.hovered = None;
+            creation.hover_valid = false;
+            creation.revision = creation.revision.wrapping_add(1);
+            break;
+        }
+    }
+}
+
+fn update_creation_input(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<TopDownCamera>>,
+    workbenches: Query<&Transform, With<Workbench>>,
+    mut creation: ResMut<CreationState>,
+) {
+    if !creation.active {
+        return;
+    }
+    if keyboard.just_pressed(KeyCode::Escape) {
+        creation.active = false;
+        creation.workbench = None;
+        creation.cubes.clear();
+        creation.hovered = None;
+        creation.revision = creation.revision.wrapping_add(1);
+        return;
+    }
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Ok((camera, camera_transform)) = cameras.single() else {
+        return;
+    };
+    let Some(workbench_entity) = creation.workbench else {
+        return;
+    };
+    let Ok(workbench) = workbenches.get(workbench_entity) else {
+        return;
+    };
+    let Some(ray) = cursor_ray(window, camera, camera_transform) else {
+        creation.hovered = None;
+        return;
+    };
+
+    let target = builder_target(ray, workbench, &creation.cubes, false);
+    creation.hovered = target.as_ref().map(|target| target.cell);
+    creation.hover_valid = target.as_ref().is_some_and(|target| target.valid);
+
+    if mouse.just_pressed(MouseButton::Left)
+        && let Some(target) = target.filter(|target| target.valid && !target.existing)
+    {
+        creation.cubes.insert(target.cell);
+        creation.revision = creation.revision.wrapping_add(1);
+    }
+    if mouse.just_pressed(MouseButton::Right)
+        && let Some(target) = builder_target(ray, workbench, &creation.cubes, true)
+        && target.existing
+        && removal_keeps_cubes_connected(&creation.cubes, target.cell)
+    {
+        creation.cubes.remove(&target.cell);
+        creation.revision = creation.revision.wrapping_add(1);
+    }
+}
+
+fn finish_creation_mode(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut commands: Commands,
+    mut creation: ResMut<CreationState>,
+    workbenches: Query<&Transform, With<Workbench>>,
+    builder_materials: Res<BuilderMaterials>,
+    builder_meshes: Res<BuilderMeshes>,
+) {
+    if !creation.active || !keyboard.just_pressed(KeyCode::Enter) || creation.cubes.is_empty() {
+        return;
+    }
+    let Some(workbench_entity) = creation.workbench else {
+        return;
+    };
+    let Ok(workbench) = workbenches.get(workbench_entity) else {
+        return;
+    };
+    let cubes = creation.cubes.clone();
+    let Some((minimum, _maximum, footprint, height)) = crafted_dimensions(&cubes) else {
+        return;
+    };
+    let cell = world_to_object_cell(workbench.translation, footprint);
+    let root_center = object_center_at(cell, footprint, height);
+    let root_center = Vec3::new(
+        root_center.x,
+        workbench.translation.y + WORKBENCH_HEIGHT / 2.0 + height / 2.0 + 0.01,
+        root_center.z,
+    );
+    let cube_material = builder_materials.cube.clone();
+    commands
+        .spawn((
+            // The finished object's bounds are a hover-only wireframe child.
+            // Keeping the root mesh-free lets the Voxel Cubes remain visible.
+            Transform::from_translation(root_center),
+            PlaceableObject {
+                cell,
+                footprint,
+                height,
+            },
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Mesh3d(builder_meshes.unit.clone()),
+                Wireframe,
+                WireframeTopology::Quads,
+                Transform::from_scale(Vec3::new(
+                    footprint.x as f32 * CELL_SIZE,
+                    height,
+                    footprint.y as f32 * CELL_SIZE,
+                )),
+                Visibility::Hidden,
+                ObjectBoundsVisual,
+            ));
+            for &cube in &cubes {
+                let local = Vec3::new(
+                    -(footprint.x as f32 * CELL_SIZE) / 2.0
+                        + (cube.x - minimum.x) as f32 * BUILDER_CELL_SIZE
+                        + BUILDER_CELL_SIZE / 2.0,
+                    -(height / 2.0)
+                        + (cube.y - minimum.y) as f32 * BUILDER_CELL_SIZE
+                        + BUILDER_CELL_SIZE / 2.0,
+                    -(footprint.y as f32 * CELL_SIZE) / 2.0
+                        + (cube.z - minimum.z) as f32 * BUILDER_CELL_SIZE
+                        + BUILDER_CELL_SIZE / 2.0,
+                );
+                parent.spawn((
+                    Mesh3d(builder_meshes.cube.clone()),
+                    MeshMaterial3d(cube_material.clone()),
+                    Transform::from_translation(local),
+                ));
+            }
+        });
+
+    creation.active = false;
+    creation.workbench = None;
+    creation.cubes.clear();
+    creation.hovered = None;
+    creation.revision = creation.revision.wrapping_add(1);
+}
+
+#[allow(clippy::type_complexity)]
+fn update_builder_visuals(
+    mut commands: Commands,
+    creation: Res<CreationState>,
+    workbenches: Query<&Transform, With<Workbench>>,
+    builder_materials: Res<BuilderMaterials>,
+    builder_meshes: Res<BuilderMeshes>,
+    mut cache: Local<BuilderVisualCache>,
+    mut visuals: ParamSet<(
+        Query<Entity, With<BuilderVoxelVisual>>,
+        Query<Entity, With<BuilderHoverVisual>>,
+        Query<&mut Visibility, With<BuilderGridVisual>>,
+    )>,
+) {
+    let scene_changed = !cache.initialized
+        || cache.active != creation.active
+        || cache.workbench != creation.workbench
+        || cache.revision != creation.revision;
+    if scene_changed {
+        for entity in visuals.p0().iter() {
+            commands.entity(entity).despawn();
+        }
+    }
+    for entity in visuals.p1().iter() {
+        commands.entity(entity).despawn();
+    }
+    for mut visibility in &mut visuals.p2() {
+        *visibility = if creation.active {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+    if !creation.active {
+        cache.active = creation.active;
+        cache.workbench = creation.workbench;
+        cache.revision = creation.revision;
+        cache.initialized = true;
+        return;
+    }
+    let Some(workbench_entity) = creation.workbench else {
+        cache.active = creation.active;
+        cache.workbench = creation.workbench;
+        cache.revision = creation.revision;
+        cache.initialized = true;
+        return;
+    };
+    let Ok(workbench) = workbenches.get(workbench_entity) else {
+        return;
+    };
+    let origin = builder_origin(workbench);
+    if scene_changed {
+        for &cell in &creation.cubes {
+            commands.spawn((
+                Mesh3d(builder_meshes.cube.clone()),
+                MeshMaterial3d(builder_materials.cube.clone()),
+                Transform::from_translation(builder_cell_center(origin, cell)),
+                BuilderVoxelVisual,
+            ));
+        }
+    }
+    if let Some(cell) = creation
+        .hovered
+        .filter(|cell| builder_cell_in_bounds(*cell))
+    {
+        commands.spawn((
+            Mesh3d(builder_meshes.unit.clone()),
+            MeshMaterial3d(if creation.hover_valid {
+                builder_materials.hover_valid.clone()
+            } else {
+                builder_materials.hover_invalid.clone()
+            }),
+            Transform::from_translation(builder_cell_center(origin, cell))
+                .with_scale(Vec3::splat(BUILDER_CELL_SIZE)),
+            BuilderHoverVisual,
+        ));
+    }
+    cache.active = creation.active;
+    cache.workbench = creation.workbench;
+    cache.revision = creation.revision;
+    cache.initialized = true;
+}
+
+fn update_creation_ui(
+    creation: Res<CreationState>,
+    mut ui: Query<(&mut Text, &mut Visibility), With<CreationUi>>,
+) {
+    for (mut text, mut visibility) in &mut ui {
+        *visibility = if creation.active {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if creation.active {
+            text.0 = format!(
+                "CREATION MODE\nLeft-click: add cube    Right-click: remove cube\nClick any face to attach on that side\nQ/E: rotate view    Cubes: {}/{}    Enter: finish    Escape: cancel",
+                creation.cubes.len(),
+                BUILDER_CELLS_PER_AXIS * BUILDER_CELLS_PER_AXIS * BUILDER_MAX_HEIGHT_CELLS
+            );
+        }
+    }
+}
+
 fn begin_object_drag(
     mouse: Res<ButtonInput<MouseButton>>,
+    creation: Res<CreationState>,
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<TopDownCamera>>,
     objects: Query<(
         Entity,
         &Transform,
         &PlaceableObject,
-        &MeshMaterial3d<StandardMaterial>,
+        Option<&MeshMaterial3d<StandardMaterial>>,
     )>,
     mut drag: ResMut<DragState>,
     mut commands: Commands,
 ) {
-    if !mouse.just_pressed(MouseButton::Left) || drag.entity.is_some() {
+    if creation.active || !mouse.just_pressed(MouseButton::Left) || drag.entity.is_some() {
         return;
     }
     let Ok(window) = windows.single() else {
@@ -410,7 +1111,7 @@ fn begin_object_drag(
     for (entity, transform, object, material) in &objects {
         let half_size = Vec3::new(
             object.footprint.x as f32 * CELL_SIZE / 2.0,
-            OBJECT_HEIGHT / 2.0,
+            object.height / 2.0,
             object.footprint.y as f32 * CELL_SIZE / 2.0,
         );
         let Some(distance) = ray_aabb_distance(
@@ -424,7 +1125,11 @@ fn begin_object_drag(
             .as_ref()
             .is_none_or(|(_, picked_distance, _)| distance < *picked_distance)
         {
-            picked = Some((entity, distance, material.0.clone()));
+            picked = Some((
+                entity,
+                distance,
+                material.map(|material| material.0.clone()),
+            ));
         }
     }
 
@@ -438,7 +1143,7 @@ fn begin_object_drag(
     drag.origin_cell = object.cell;
     drag.current_cell = object.cell;
     drag.valid = true;
-    drag.original_material = Some(original_material);
+    drag.original_material = original_material;
     // The marker is useful for rendering/state inspection, but the drag resource
     // is the source of truth. This lets the following systems handle the same
     // click without waiting for deferred Commands to become queryable.
@@ -448,15 +1153,17 @@ fn begin_object_drag(
         .insert((ObjectPreview, DraggingObject));
 }
 
+#[allow(clippy::type_complexity)]
 fn update_object_drag(
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<TopDownCamera>>,
+    workbenches: Query<&Workbench>,
     mut objects: ParamSet<(
         Query<(Entity, &PlaceableObject)>,
         Query<(
             &mut Transform,
             &PlaceableObject,
-            &mut MeshMaterial3d<StandardMaterial>,
+            Option<&mut MeshMaterial3d<StandardMaterial>>,
         )>,
     )>,
     materials: Res<PlacementMaterials>,
@@ -491,21 +1198,28 @@ fn update_object_drag(
             .iter()
             .filter(|(other_entity, _)| *other_entity != entity)
             .map(|(_, object)| (object.cell, object.footprint))
+            .chain(
+                workbenches
+                    .iter()
+                    .map(|workbench| (workbench.cell, workbench.footprint)),
+            )
             .collect::<Vec<_>>()
     };
     let valid = valid_placement(candidate, footprint, other_objects);
     let mut selected = objects.p1();
-    let Ok((mut transform, object, mut material)) = selected.get_mut(entity) else {
+    let Ok((mut transform, object, material)) = selected.get_mut(entity) else {
         return;
     };
     drag.current_cell = candidate;
     drag.valid = valid;
-    transform.translation = object_center(candidate, object.footprint);
-    material.0 = if valid {
-        materials.valid.clone()
-    } else {
-        materials.invalid.clone()
-    };
+    transform.translation = object_center_at(candidate, object.footprint, object.height);
+    if let Some(mut material) = material {
+        material.0 = if valid {
+            materials.valid.clone()
+        } else {
+            materials.invalid.clone()
+        };
+    }
 }
 
 fn finish_object_drag(
@@ -514,7 +1228,7 @@ fn finish_object_drag(
     mut objects: Query<(
         &mut Transform,
         &mut PlaceableObject,
-        &mut MeshMaterial3d<StandardMaterial>,
+        Option<&mut MeshMaterial3d<StandardMaterial>>,
     )>,
     mut drag: ResMut<DragState>,
 ) {
@@ -531,7 +1245,7 @@ fn finish_object_drag(
     let Some(entity) = drag.entity else {
         return;
     };
-    let Ok((mut transform, mut object, mut material)) = objects.get_mut(entity) else {
+    let Ok((mut transform, mut object, material)) = objects.get_mut(entity) else {
         return;
     };
     let origin_cell = drag.origin_cell;
@@ -543,14 +1257,66 @@ fn finish_object_drag(
     if valid {
         object.cell = current_cell;
     } else {
-        transform.translation = object_center(origin_cell, object.footprint);
+        transform.translation = object_center_at(origin_cell, object.footprint, object.height);
     }
-    if let Some(original_material) = original_material {
+    if let (Some(original_material), Some(mut material)) = (original_material, material) {
         material.0 = original_material;
     }
     commands
         .entity(entity)
         .remove::<(ObjectPreview, DraggingObject)>();
+}
+
+fn update_object_bounds(
+    creation: Res<CreationState>,
+    drag: Res<DragState>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cameras: Query<(&Camera, &GlobalTransform), With<TopDownCamera>>,
+    objects: Query<(Entity, &Transform, &PlaceableObject, &Children)>,
+    mut bounds: Query<&mut Visibility, With<ObjectBoundsVisual>>,
+) {
+    let hovered = if creation.active {
+        None
+    } else {
+        let ray = windows.single().ok().and_then(|window| {
+            cameras
+                .single()
+                .ok()
+                .and_then(|(camera, transform)| cursor_ray(window, camera, transform))
+        });
+        ray.and_then(|ray| {
+            objects
+                .iter()
+                .filter_map(|(entity, transform, object, _)| {
+                    let half_size = Vec3::new(
+                        object.footprint.x as f32 * CELL_SIZE / 2.0,
+                        object.height / 2.0,
+                        object.footprint.y as f32 * CELL_SIZE / 2.0,
+                    );
+                    ray_aabb_distance(
+                        ray,
+                        transform.translation - half_size,
+                        transform.translation + half_size,
+                    )
+                    .map(|distance| (entity, distance))
+                })
+                .min_by(|left, right| left.1.total_cmp(&right.1))
+                .map(|(entity, _)| entity)
+        })
+    };
+
+    for (entity, _transform, _object, children) in &objects {
+        let visible = hovered == Some(entity) || drag.entity == Some(entity);
+        for child in children.iter() {
+            if let Ok(mut visibility) = bounds.get_mut(child) {
+                *visibility = if visible {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                };
+            }
+        }
+    }
 }
 
 fn update_performance_overlay(
@@ -572,6 +1338,8 @@ fn update_performance_overlay(
 }
 
 fn rotate_camera(keyboard: Res<ButtonInput<KeyCode>>, mut orbit: ResMut<CameraOrbit>) {
+    // Q/E also orbit the camera around the Workbench during Creation Mode so
+    // cubes can be placed on and inspected from every side.
     let direction = i32::from(keyboard.just_pressed(KeyCode::KeyE))
         - i32::from(keyboard.just_pressed(KeyCode::KeyQ));
     orbit.step = (orbit.step + direction).rem_euclid(8);
@@ -579,11 +1347,15 @@ fn rotate_camera(keyboard: Res<ButtonInput<KeyCode>>, mut orbit: ResMut<CameraOr
 
 fn move_player(
     keyboard: Res<ButtonInput<KeyCode>>,
+    creation: Res<CreationState>,
     orbit: Res<CameraOrbit>,
     time: Res<Time>,
     camera: Query<&Transform, (With<TopDownCamera>, Without<Player>)>,
     mut player: Query<&mut Transform, With<Player>>,
 ) {
+    if creation.active {
+        return;
+    }
     let Ok(camera) = camera.single() else {
         return;
     };
@@ -622,23 +1394,65 @@ fn move_player(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn follow_player_camera(
     mut orbit: ResMut<CameraOrbit>,
     time: Res<Time>,
+    creation: Res<CreationState>,
     player: Query<&Transform, (With<Player>, Without<TopDownCamera>)>,
-    mut camera: Query<&mut Transform, (With<TopDownCamera>, Without<Player>)>,
+    workbenches: Query<&Transform, (With<Workbench>, Without<TopDownCamera>)>,
+    mut camera: Query<
+        (&mut Transform, Option<&mut Projection>),
+        (With<TopDownCamera>, Without<Player>),
+    >,
 ) {
     let Ok(player_transform) = player.single() else {
         return;
     };
-    let Ok(mut camera_transform) = camera.single_mut() else {
+    let Ok((mut camera_transform, mut projection)) = camera.single_mut() else {
         return;
     };
 
-    let target = player_transform.translation;
     orbit.update(time.delta_secs());
-    camera_transform.translation = target + orbit.current_offset();
+    let (target, offset, viewport) = if creation.active {
+        let Some(workbench_entity) = creation.workbench else {
+            return;
+        };
+        let Ok(workbench) = workbenches.get(workbench_entity) else {
+            return;
+        };
+        (
+            workbench.translation + Vec3::Y * (WORKBENCH_HEIGHT / 2.0 + BUILDER_WORLD_SIZE / 2.0),
+            orbit.current_offset() * BUILDER_CAMERA_DISTANCE_SCALE,
+            BUILDER_CAMERA_VIEWPORT,
+        )
+    } else {
+        (
+            player_transform.translation,
+            orbit.current_offset(),
+            WORLD_CAMERA_VIEWPORT,
+        )
+    };
+    let desired_position = target + offset;
+    let should_ease = creation.active
+        || projection.is_some()
+            && camera_transform
+                .translation
+                .distance_squared(desired_position)
+                > 0.000001;
+    if should_ease {
+        let easing = 1.0 - (-CAMERA_FOCUS_DECAY_RATE * time.delta_secs()).exp();
+        camera_transform.translation = camera_transform.translation.lerp(desired_position, easing);
+    } else {
+        camera_transform.translation = desired_position;
+    }
     camera_transform.look_at(target, Vec3::Y);
+
+    if let Some(Projection::Orthographic(projection)) = projection.as_deref_mut() {
+        projection.scaling_mode = ScalingMode::FixedVertical {
+            viewport_height: viewport,
+        };
+    }
 }
 
 #[cfg(test)]
@@ -658,6 +1472,7 @@ mod tests {
         app.insert_resource(input)
             .insert_resource(time)
             .init_resource::<CameraOrbit>()
+            .init_resource::<CreationState>()
             .add_systems(
                 Update,
                 (rotate_camera, move_player, follow_player_camera).chain(),
@@ -816,6 +1631,7 @@ mod tests {
         input.press(MouseButton::Left);
         app.insert_resource(input)
             .init_resource::<DragState>()
+            .init_resource::<CreationState>()
             .insert_resource(PlacementMaterials {
                 valid: Handle::default(),
                 invalid: Handle::default(),
@@ -853,10 +1669,10 @@ mod tests {
             .world_mut()
             .spawn((
                 Transform::from_translation(object_center(IVec2::new(39, 39), OBJECT_FOOTPRINT)),
-                MeshMaterial3d::<StandardMaterial>(Handle::default()),
                 PlaceableObject {
                     cell: IVec2::new(39, 39),
                     footprint: OBJECT_FOOTPRINT,
+                    height: OBJECT_HEIGHT,
                 },
             ))
             .id();
@@ -890,6 +1706,57 @@ mod tests {
         );
         assert!(app.world().get::<DraggingObject>(object).is_none());
         assert!(app.world().get::<ObjectPreview>(object).is_none());
+    }
+
+    #[test]
+    fn crafted_dimensions_round_a_single_voxel_to_one_placement_cell() {
+        let cubes = HashSet::from([IVec3::new(2, 1, 3)]);
+        let (minimum, maximum, footprint, height) = crafted_dimensions(&cubes).unwrap();
+        assert_eq!(minimum, IVec3::new(2, 1, 3));
+        assert_eq!(maximum, minimum);
+        assert_eq!(footprint, IVec2::ONE);
+        assert_eq!(height, CELL_SIZE);
+    }
+
+    #[test]
+    fn builder_allows_face_attachment_and_keeps_volume_bounded() {
+        let cubes = HashSet::from([IVec3::new(2, 2, 2)]);
+        assert!(builder_has_neighbor(&cubes, IVec3::new(2, 2, 3)));
+        assert!(builder_cell_in_bounds(IVec3::ZERO));
+        assert!(builder_cell_in_bounds(IVec3::splat(
+            BUILDER_CELLS_PER_AXIS - 1
+        )));
+        assert!(!builder_cell_in_bounds(IVec3::splat(
+            BUILDER_CELLS_PER_AXIS
+        )));
+    }
+
+    #[test]
+    fn builder_height_is_capped_at_fifty_voxel_cubes() {
+        let cubes = HashSet::from([IVec3::ZERO, IVec3::new(0, BUILDER_MAX_HEIGHT_CELLS - 1, 0)]);
+        let (_, _, _, height) = crafted_dimensions(&cubes).unwrap();
+        assert_eq!(height, BUILDER_MAX_HEIGHT_CELLS as f32 * BUILDER_CELL_SIZE);
+        assert!(builder_cell_in_bounds(IVec3::new(
+            0,
+            BUILDER_MAX_HEIGHT_CELLS - 1,
+            0
+        )));
+        assert!(!builder_cell_in_bounds(IVec3::new(
+            0,
+            BUILDER_MAX_HEIGHT_CELLS,
+            0
+        )));
+    }
+
+    #[test]
+    fn builder_removal_preserves_floor_connectivity() {
+        let cubes = HashSet::from([
+            IVec3::new(0, 0, 0),
+            IVec3::new(0, 1, 0),
+            IVec3::new(3, 0, 0),
+        ]);
+        assert!(!removal_keeps_cubes_connected(&cubes, IVec3::ZERO));
+        assert!(removal_keeps_cubes_connected(&cubes, IVec3::new(0, 1, 0)));
     }
 
     #[test]
