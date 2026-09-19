@@ -123,7 +123,7 @@ struct DragState {
     origin_cell: IVec2,
     current_cell: IVec2,
     valid: bool,
-    original_material: Option<Handle<StandardMaterial>>,
+    original_materials: Vec<(Entity, Handle<StandardMaterial>)>,
     just_picked: bool,
 }
 
@@ -728,6 +728,42 @@ struct BuilderTarget {
     valid: bool,
 }
 
+fn collect_object_materials(
+    entity: Entity,
+    children: &Query<&Children>,
+    materials: &Query<&MeshMaterial3d<StandardMaterial>>,
+    collected: &mut Vec<(Entity, Handle<StandardMaterial>)>,
+) {
+    if let Ok(material) = materials.get(entity) {
+        collected.push((entity, material.0.clone()));
+    }
+    let child_entities = children
+        .get(entity)
+        .map(|children| children.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for child in child_entities {
+        collect_object_materials(child, children, materials, collected);
+    }
+}
+
+fn set_object_materials(
+    entity: Entity,
+    children: &Query<&Children>,
+    materials: &mut Query<&mut MeshMaterial3d<StandardMaterial>>,
+    preview_material: &Handle<StandardMaterial>,
+) {
+    if let Ok(mut material) = materials.get_mut(entity) {
+        material.0 = preview_material.clone();
+    }
+    let child_entities = children
+        .get(entity)
+        .map(|children| children.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for child in child_entities {
+        set_object_materials(child, children, materials, preview_material);
+    }
+}
+
 fn builder_target(
     ray: Ray3d,
     workbench: &Transform,
@@ -931,6 +967,7 @@ fn finish_creation_mode(
             // The finished object's bounds are a hover-only wireframe child.
             // Keeping the root mesh-free lets the Voxel Cubes remain visible.
             Transform::from_translation(root_center),
+            Visibility::Inherited,
             PlaceableObject {
                 cell,
                 footprint,
@@ -1080,17 +1117,15 @@ fn update_creation_ui(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn begin_object_drag(
     mouse: Res<ButtonInput<MouseButton>>,
     creation: Res<CreationState>,
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<TopDownCamera>>,
-    objects: Query<(
-        Entity,
-        &Transform,
-        &PlaceableObject,
-        Option<&MeshMaterial3d<StandardMaterial>>,
-    )>,
+    objects: Query<(Entity, &Transform, &PlaceableObject)>,
+    children: Query<&Children>,
+    materials: Query<&MeshMaterial3d<StandardMaterial>>,
     mut drag: ResMut<DragState>,
     mut commands: Commands,
 ) {
@@ -1108,7 +1143,7 @@ fn begin_object_drag(
     };
 
     let mut picked = None;
-    for (entity, transform, object, material) in &objects {
+    for (entity, transform, object) in &objects {
         let half_size = Vec3::new(
             object.footprint.x as f32 * CELL_SIZE / 2.0,
             object.height / 2.0,
@@ -1123,27 +1158,25 @@ fn begin_object_drag(
         };
         if picked
             .as_ref()
-            .is_none_or(|(_, picked_distance, _)| distance < *picked_distance)
+            .is_none_or(|(_, picked_distance)| distance < *picked_distance)
         {
-            picked = Some((
-                entity,
-                distance,
-                material.map(|material| material.0.clone()),
-            ));
+            picked = Some((entity, distance));
         }
     }
 
-    let Some((entity, _, original_material)) = picked else {
+    let Some((entity, _)) = picked else {
         return;
     };
-    let Ok((_, _, object, _)) = objects.get(entity) else {
+    let Ok((_, _, object)) = objects.get(entity) else {
         return;
     };
+    let mut original_materials = Vec::new();
+    collect_object_materials(entity, &children, &materials, &mut original_materials);
     drag.entity = Some(entity);
     drag.origin_cell = object.cell;
     drag.current_cell = object.cell;
     drag.valid = true;
-    drag.original_material = original_material;
+    drag.original_materials = original_materials;
     // The marker is useful for rendering/state inspection, but the drag resource
     // is the source of truth. This lets the following systems handle the same
     // click without waiting for deferred Commands to become queryable.
@@ -1153,19 +1186,17 @@ fn begin_object_drag(
         .insert((ObjectPreview, DraggingObject));
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn update_object_drag(
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<TopDownCamera>>,
     workbenches: Query<&Workbench>,
     mut objects: ParamSet<(
         Query<(Entity, &PlaceableObject)>,
-        Query<(
-            &mut Transform,
-            &PlaceableObject,
-            Option<&mut MeshMaterial3d<StandardMaterial>>,
-        )>,
+        Query<(&mut Transform, &PlaceableObject)>,
     )>,
+    children: Query<&Children>,
+    mut visual_materials: Query<&mut MeshMaterial3d<StandardMaterial>>,
     materials: Res<PlacementMaterials>,
     mut drag: ResMut<DragState>,
 ) {
@@ -1207,29 +1238,25 @@ fn update_object_drag(
     };
     let valid = valid_placement(candidate, footprint, other_objects);
     let mut selected = objects.p1();
-    let Ok((mut transform, object, material)) = selected.get_mut(entity) else {
+    let Ok((mut transform, object)) = selected.get_mut(entity) else {
         return;
     };
     drag.current_cell = candidate;
     drag.valid = valid;
     transform.translation = object_center_at(candidate, object.footprint, object.height);
-    if let Some(mut material) = material {
-        material.0 = if valid {
-            materials.valid.clone()
-        } else {
-            materials.invalid.clone()
-        };
-    }
+    let preview_material = if valid {
+        materials.valid.clone()
+    } else {
+        materials.invalid.clone()
+    };
+    set_object_materials(entity, &children, &mut visual_materials, &preview_material);
 }
 
 fn finish_object_drag(
     mouse: Res<ButtonInput<MouseButton>>,
     mut commands: Commands,
-    mut objects: Query<(
-        &mut Transform,
-        &mut PlaceableObject,
-        Option<&mut MeshMaterial3d<StandardMaterial>>,
-    )>,
+    mut objects: Query<(&mut Transform, &mut PlaceableObject)>,
+    mut materials: Query<&mut MeshMaterial3d<StandardMaterial>>,
     mut drag: ResMut<DragState>,
 ) {
     // The click that picked the object must not also drop it. This is kept in
@@ -1245,13 +1272,15 @@ fn finish_object_drag(
     let Some(entity) = drag.entity else {
         return;
     };
-    let Ok((mut transform, mut object, material)) = objects.get_mut(entity) else {
+    let Ok((mut transform, mut object)) = objects.get_mut(entity) else {
+        drag.entity = None;
+        drag.original_materials.clear();
         return;
     };
     let origin_cell = drag.origin_cell;
     let current_cell = drag.current_cell;
     let valid = drag.valid;
-    let original_material = drag.original_material.take();
+    let original_materials = std::mem::take(&mut drag.original_materials);
     drag.entity = None;
 
     if valid {
@@ -1259,8 +1288,10 @@ fn finish_object_drag(
     } else {
         transform.translation = object_center_at(origin_cell, object.footprint, object.height);
     }
-    if let (Some(original_material), Some(mut material)) = (original_material, material) {
-        material.0 = original_material;
+    for (material_entity, original_material) in original_materials {
+        if let Ok(mut material) = materials.get_mut(material_entity) {
+            material.0 = original_material;
+        }
     }
     commands
         .entity(entity)
@@ -1629,12 +1660,17 @@ mod tests {
         let mut app = App::new();
         let mut input = ButtonInput::<MouseButton>::default();
         input.press(MouseButton::Left);
-        app.insert_resource(input)
+        let mut material_assets = Assets::<StandardMaterial>::default();
+        let original_material = material_assets.add(StandardMaterial::default());
+        let valid_material = material_assets.add(StandardMaterial::default());
+        let invalid_material = material_assets.add(StandardMaterial::default());
+        app.insert_resource(material_assets)
+            .insert_resource(input)
             .init_resource::<DragState>()
             .init_resource::<CreationState>()
             .insert_resource(PlacementMaterials {
-                valid: Handle::default(),
-                invalid: Handle::default(),
+                valid: valid_material.clone(),
+                invalid: invalid_material,
             })
             .add_systems(
                 Update,
@@ -1676,9 +1712,21 @@ mod tests {
                 },
             ))
             .id();
+        let shape = app
+            .world_mut()
+            .spawn((MeshMaterial3d(original_material.clone()),))
+            .id();
+        app.world_mut().entity_mut(object).add_child(shape);
 
         app.world_mut().run_schedule(Update);
         assert_eq!(app.world().resource::<DragState>().entity, Some(object));
+        assert_eq!(
+            app.world()
+                .get::<MeshMaterial3d<StandardMaterial>>(shape)
+                .unwrap()
+                .0,
+            valid_material
+        );
         assert!(app.world().get::<DraggingObject>(object).is_some());
         assert!(app.world().get::<ObjectPreview>(object).is_some());
 
@@ -1703,6 +1751,13 @@ mod tests {
         assert_eq!(
             app.world().get::<PlaceableObject>(object).unwrap().cell,
             moved_cell
+        );
+        assert_eq!(
+            app.world()
+                .get::<MeshMaterial3d<StandardMaterial>>(shape)
+                .unwrap()
+                .0,
+            original_material
         );
         assert!(app.world().get::<DraggingObject>(object).is_none());
         assert!(app.world().get::<ObjectPreview>(object).is_none());
