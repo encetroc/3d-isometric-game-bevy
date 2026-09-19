@@ -1,6 +1,7 @@
 use bevy::{
     camera::ScalingMode,
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
+    input::mouse::{AccumulatedMouseScroll, MouseScrollUnit},
     math::Ray3d,
     pbr::wireframe::{Wireframe, WireframePlugin, WireframeTopology},
     prelude::*,
@@ -34,6 +35,10 @@ const CAMERA_ROTATION_DECAY_RATE: f32 = 12.0;
 const CAMERA_FOCUS_DECAY_RATE: f32 = 10.0;
 const CAMERA_ROTATION_SNAP_THRESHOLD: f32 = 0.0001;
 const WORLD_CAMERA_VIEWPORT: f32 = 14.0;
+const INITIAL_CAMERA_SCALE: f32 = 0.85;
+const CAMERA_ZOOM_MIN: f32 = 0.5;
+const CAMERA_ZOOM_MAX: f32 = 2.0;
+const CAMERA_ZOOM_SPEED: f32 = 0.12;
 const BUILDER_CAMERA_VIEWPORT: f32 = 2.0;
 const BUILDER_CAMERA_DISTANCE_SCALE: f32 = 0.24;
 
@@ -180,7 +185,7 @@ fn main() {
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Capsule Wanderer".into(),
-                resolution: WindowResolution::new(1280, 720),
+                resolution: WindowResolution::new(1920, 1080),
                 ..default()
             }),
             ..default()
@@ -196,6 +201,7 @@ fn main() {
             (
                 begin_creation_mode,
                 rotate_camera,
+                zoom_camera,
                 move_player,
                 follow_player_camera,
                 update_creation_input,
@@ -459,22 +465,11 @@ fn setup(
             scaling_mode: ScalingMode::FixedVertical {
                 viewport_height: WORLD_CAMERA_VIEWPORT,
             },
+            scale: INITIAL_CAMERA_SCALE,
             ..OrthographicProjection::default_3d()
         }),
         Transform::from_translation(player_start + CAMERA_OFFSET).looking_at(player_start, Vec3::Y),
         TopDownCamera,
-    ));
-
-    commands.spawn((
-        Text::new(
-            "WASD / Arrow Keys  •  Move    Q / E  •  Orbit camera 45°\nClick an object to grab, move it, then click again to drop  •  Green = valid  •  Red = blocked\nRight-click the Workbench to create a voxel object",
-        ),
-        Node {
-            position_type: PositionType::Absolute,
-            top: px(18),
-            left: px(18),
-            ..default()
-        },
     ));
 
     commands.spawn((
@@ -1365,6 +1360,31 @@ fn update_performance_overlay(
 
     for mut text in &mut overlays {
         text.0 = format!("PERFORMANCE\nFPS: {fps}\nFrame time: {frame_time}");
+    }
+}
+
+fn zoom_camera(
+    mouse_scroll: Res<AccumulatedMouseScroll>,
+    mut camera: Query<&mut Projection, With<TopDownCamera>>,
+) {
+    let scroll = match mouse_scroll.unit {
+        MouseScrollUnit::Line => mouse_scroll.delta.y,
+        MouseScrollUnit::Pixel => {
+            mouse_scroll.delta.y / MouseScrollUnit::SCROLL_UNIT_CONVERSION_FACTOR
+        }
+    };
+    if scroll.abs() < f32::EPSILON {
+        return;
+    }
+
+    let Ok(mut projection) = camera.single_mut() else {
+        return;
+    };
+    if let Projection::Orthographic(projection) = &mut *projection {
+        // Positive wheel input zooms in. Exponential scaling keeps each notch
+        // feeling consistent at every zoom level and never flips the camera.
+        projection.scale = (projection.scale * (-scroll * CAMERA_ZOOM_SPEED).exp())
+            .clamp(CAMERA_ZOOM_MIN, CAMERA_ZOOM_MAX);
     }
 }
 

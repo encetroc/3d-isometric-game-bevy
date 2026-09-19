@@ -13,6 +13,7 @@ cargo run
 - `WASD` or arrow keys: move relative to the camera (up moves toward the top of the view)
 - Diagonals have the same ground speed as cardinal movement.
 - `Q` / `E`: smoothly orbit the camera in opposite directions, 45° per press (holding does not repeat).
+- Mouse wheel: zoom in and out.
 - Click a colored object to grab it, move the cursor, then click again to drop it.
   - Green preview: the placement is inside the World and does not overlap another object or the Workbench.
   - Red preview: clicking to drop returns the object to its previous cell.
