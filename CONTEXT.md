@@ -23,7 +23,7 @@ _Avoid_: Checker Tile, terrain tile
 ## Objects
 
 **Placeable Object**:
-A simple object that exists in the World and can be picked up, previewed, and dropped onto the Placement Grid.
+A simple object that exists in the World and can be picked up, previewed, and dropped onto the Placement Grid. A Placeable Object may be stacked on another when its full footprint is supported; its base height is then the support's top surface.
 _Avoid_: Item, prop
 
 **Crafted Object**:

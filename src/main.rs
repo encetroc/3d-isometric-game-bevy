@@ -77,6 +77,8 @@ struct PlaceableObject {
     cell: IVec2,
     footprint: IVec2,
     height: f32,
+    /// Height above the ground tile where this object's bottom starts.
+    base_height: f32,
 }
 
 #[derive(Component)]
@@ -127,6 +129,8 @@ struct DragState {
     entity: Option<Entity>,
     origin_cell: IVec2,
     current_cell: IVec2,
+    origin_base_height: f32,
+    current_base_height: f32,
     valid: bool,
     original_materials: Vec<(Entity, Handle<StandardMaterial>)>,
     just_picked: bool,
@@ -441,6 +445,7 @@ fn setup(
                     cell,
                     footprint: OBJECT_FOOTPRINT,
                     height: OBJECT_HEIGHT,
+                    base_height: 0.0,
                 },
             ))
             .with_children(|parent| {
@@ -514,9 +519,13 @@ fn object_center(cell: IVec2, footprint: IVec2) -> Vec3 {
 }
 
 fn object_center_at(cell: IVec2, footprint: IVec2, height: f32) -> Vec3 {
+    object_center_at_base(cell, footprint, height, 0.0)
+}
+
+fn object_center_at_base(cell: IVec2, footprint: IVec2, height: f32, base_height: f32) -> Vec3 {
     Vec3::new(
         WORLD_MIN + (cell.x as f32 + footprint.x as f32 / 2.0) * CELL_SIZE,
-        TILE_THICKNESS + height / 2.0,
+        TILE_THICKNESS + base_height + height / 2.0,
         WORLD_MIN + (cell.y as f32 + footprint.y as f32 / 2.0) * CELL_SIZE,
     )
 }
@@ -544,6 +553,59 @@ where
         && other_objects.into_iter().all(|(cell, other_footprint)| {
             !cells_overlap(candidate, footprint, cell, other_footprint)
         })
+}
+
+fn footprint_contains(
+    container_cell: IVec2,
+    container_footprint: IVec2,
+    candidate_cell: IVec2,
+    candidate_footprint: IVec2,
+) -> bool {
+    candidate_cell.x >= container_cell.x
+        && candidate_cell.y >= container_cell.y
+        && candidate_cell.x + candidate_footprint.x <= container_cell.x + container_footprint.x
+        && candidate_cell.y + candidate_footprint.y <= container_cell.y + container_footprint.y
+}
+
+/// Return the surface height for a candidate placement.
+///
+/// An object is placed on the ground when its footprint is clear. When it
+/// overlaps another object, the whole candidate footprint must fit on one of
+/// those objects. This keeps stacked objects supported instead of allowing
+/// them to float from a corner or overlap an object at the same height.
+fn stacking_base_height<I>(candidate: IVec2, footprint: IVec2, objects: I) -> Option<f32>
+where
+    I: IntoIterator<Item = (IVec2, IVec2, f32, f32)>,
+{
+    let overlapping = objects
+        .into_iter()
+        .filter(|(cell, other_footprint, _, _)| {
+            cells_overlap(candidate, footprint, *cell, *other_footprint)
+        })
+        .collect::<Vec<_>>();
+
+    if overlapping.is_empty() {
+        return Some(0.0);
+    }
+
+    let support_height = overlapping
+        .iter()
+        .filter(|(cell, other_footprint, _, _)| {
+            footprint_contains(*cell, *other_footprint, candidate, footprint)
+        })
+        .map(|(_, _, base_height, height)| base_height + height)
+        .max_by(|left, right| left.total_cmp(right))?;
+
+    // A taller object that only partially intersects the candidate would be a
+    // collision, not a valid support.
+    if overlapping
+        .iter()
+        .any(|(_, _, base_height, height)| *base_height + *height > support_height + f32::EPSILON)
+    {
+        return None;
+    }
+
+    Some(support_height)
 }
 
 fn cursor_ray(
@@ -950,12 +1012,8 @@ fn finish_creation_mode(
         return;
     };
     let cell = world_to_object_cell(workbench.translation, footprint);
-    let root_center = object_center_at(cell, footprint, height);
-    let root_center = Vec3::new(
-        root_center.x,
-        workbench.translation.y + WORKBENCH_HEIGHT / 2.0 + height / 2.0 + 0.01,
-        root_center.z,
-    );
+    let base_height = workbench.translation.y + WORKBENCH_HEIGHT / 2.0 + 0.01 - TILE_THICKNESS;
+    let root_center = object_center_at_base(cell, footprint, height, base_height);
     let cube_material = builder_materials.cube.clone();
     commands
         .spawn((
@@ -967,6 +1025,7 @@ fn finish_creation_mode(
                 cell,
                 footprint,
                 height,
+                base_height,
             },
         ))
         .with_children(|parent| {
@@ -1170,6 +1229,8 @@ fn begin_object_drag(
     drag.entity = Some(entity);
     drag.origin_cell = object.cell;
     drag.current_cell = object.cell;
+    drag.origin_base_height = object.base_height;
+    drag.current_base_height = object.base_height;
     drag.valid = true;
     drag.original_materials = original_materials;
     // The marker is useful for rendering/state inspection, but the drag resource
@@ -1218,28 +1279,47 @@ fn update_object_drag(
         selected_object.footprint
     };
     let candidate = world_to_object_cell(world_position, footprint);
-    let other_objects = {
+    let (other_objects, workbench_overlap) = {
         let all_objects = objects.p0();
-        all_objects
+        let other_objects = all_objects
             .iter()
             .filter(|(other_entity, _)| *other_entity != entity)
-            .map(|(_, object)| (object.cell, object.footprint))
-            .chain(
-                workbenches
-                    .iter()
-                    .map(|workbench| (workbench.cell, workbench.footprint)),
-            )
-            .collect::<Vec<_>>()
+            .map(|(_, object)| {
+                (
+                    object.cell,
+                    object.footprint,
+                    object.base_height,
+                    object.height,
+                )
+            })
+            .collect::<Vec<_>>();
+        let workbench_overlap = workbenches.iter().any(|workbench| {
+            cells_overlap(candidate, footprint, workbench.cell, workbench.footprint)
+        });
+        (other_objects, workbench_overlap)
     };
-    let valid = valid_placement(candidate, footprint, other_objects);
+    let base_height = if valid_placement(candidate, footprint, std::iter::empty::<(IVec2, IVec2)>())
+        && !workbench_overlap
+    {
+        stacking_base_height(candidate, footprint, other_objects)
+    } else {
+        None
+    };
     let mut selected = objects.p1();
     let Ok((mut transform, object)) = selected.get_mut(entity) else {
         return;
     };
+    let preview_base_height = base_height.unwrap_or(0.0);
     drag.current_cell = candidate;
-    drag.valid = valid;
-    transform.translation = object_center_at(candidate, object.footprint, object.height);
-    let preview_material = if valid {
+    drag.current_base_height = preview_base_height;
+    drag.valid = base_height.is_some();
+    transform.translation = object_center_at_base(
+        candidate,
+        object.footprint,
+        object.height,
+        preview_base_height,
+    );
+    let preview_material = if drag.valid {
         materials.valid.clone()
     } else {
         materials.invalid.clone()
@@ -1274,14 +1354,28 @@ fn finish_object_drag(
     };
     let origin_cell = drag.origin_cell;
     let current_cell = drag.current_cell;
+    let origin_base_height = drag.origin_base_height;
+    let current_base_height = drag.current_base_height;
     let valid = drag.valid;
     let original_materials = std::mem::take(&mut drag.original_materials);
     drag.entity = None;
 
     if valid {
         object.cell = current_cell;
+        object.base_height = current_base_height;
+        transform.translation = object_center_at_base(
+            current_cell,
+            object.footprint,
+            object.height,
+            current_base_height,
+        );
     } else {
-        transform.translation = object_center_at(origin_cell, object.footprint, object.height);
+        transform.translation = object_center_at_base(
+            origin_cell,
+            object.footprint,
+            object.height,
+            origin_base_height,
+        );
     }
     for (material_entity, original_material) in original_materials {
         if let Ok(mut material) = materials.get_mut(material_entity) {
@@ -1729,6 +1823,7 @@ mod tests {
                     cell: IVec2::new(39, 39),
                     footprint: OBJECT_FOOTPRINT,
                     height: OBJECT_HEIGHT,
+                    base_height: 0.0,
                 },
             ))
             .id();
@@ -1850,6 +1945,44 @@ mod tests {
                 IVec2::new(2, 2),
             ),
             IVec2::new(5, 3)
+        );
+    }
+
+    #[test]
+    fn stacking_uses_the_top_surface_of_a_supporting_object() {
+        let support = (IVec2::new(10, 10), IVec2::new(2, 2), 0.0, OBJECT_HEIGHT);
+        assert_eq!(
+            stacking_base_height(IVec2::new(10, 10), IVec2::new(2, 2), [support]),
+            Some(OBJECT_HEIGHT)
+        );
+        assert_eq!(
+            stacking_base_height(
+                IVec2::new(10, 10),
+                IVec2::new(1, 1),
+                [(
+                    IVec2::new(10, 10),
+                    IVec2::new(2, 2),
+                    OBJECT_HEIGHT,
+                    OBJECT_HEIGHT,
+                )]
+            ),
+            Some(OBJECT_HEIGHT * 2.0)
+        );
+    }
+
+    #[test]
+    fn stacking_rejects_partial_support_and_allows_clear_ground() {
+        assert_eq!(
+            stacking_base_height(
+                IVec2::new(10, 10),
+                IVec2::new(2, 2),
+                [(IVec2::new(11, 10), IVec2::new(2, 2), 0.0, OBJECT_HEIGHT,)]
+            ),
+            None
+        );
+        assert_eq!(
+            stacking_base_height(IVec2::new(10, 10), IVec2::new(2, 2), []),
+            Some(0.0)
         );
     }
 

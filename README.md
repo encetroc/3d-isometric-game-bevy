@@ -15,8 +15,9 @@ cargo run
 - `Q` / `E`: smoothly orbit the camera in opposite directions, 45° per press (holding does not repeat).
 - Mouse wheel: zoom in and out.
 - Click a colored object to grab it, move the cursor, then click again to drop it.
-  - Green preview: the placement is inside the World and does not overlap another object or the Workbench.
-  - Red preview: clicking to drop returns the object to its previous cell.
+  - Green preview: the placement is inside the World, avoids the Workbench, and either sits on clear ground or is fully supported by another object.
+  - Objects can be stacked by dragging one onto another; the object is placed on the support's top surface.
+  - Red preview: clicking to drop returns the object to its previous position.
 - Right-click the brown Workbench to enter Creation Mode.
   - Left-click the floor to add a 0.25-unit Voxel Cube; click a cube face to attach another cube there.
   - The Workbench is a 1×1 world-tile surface with a visible 4×4 placement grid.
